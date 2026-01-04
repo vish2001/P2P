@@ -33,11 +33,6 @@ int led_status = 0;
 int destination = 0;
 int sender = 0;
 
-//temp
-
-static uint32_t last_live_print_ms = 0;
-static const uint32_t LIVE_PRINT_PERIOD_MS = 1000;  // ~3 Hz, readable
-
 // State machine states
 enum class NodeState {
     LISTENING,
@@ -139,8 +134,8 @@ void setup() {
     initializeUWB();
     
     // Configure logger
-    //rangeLogger.setVerbose(false);
-    //rangeLogger.setJsonOutput(false);
+    rangeLogger.setVerbose(true);
+    rangeLogger.setJsonOutput(false);
     
     // Start in listening mode
     enterListeningMode();
@@ -193,19 +188,19 @@ void loop() {
             break;
     }
     
-    // // Periodic status output (every 5 seconds)
-    // static uint32_t last_status = 0;
-    // if (millis() - last_status > 5000) {
-    //     printStatus();
-    //     last_status = millis();
-    // }
+    // Periodic status output (every 5 seconds)
+    static uint32_t last_status = 0;
+    if (millis() - last_status > 5000) {
+        printStatus();
+        last_status = millis();
+    }
     
-    // // Flush logs periodically
-    // static uint32_t last_flush = 0;
-    // if (millis() - last_flush > 1000) {
-    //     rangeLogger.flushToSerial();
-    //     last_flush = millis();
-    // }
+    // Flush logs periodically
+    static uint32_t last_flush = 0;
+    if (millis() - last_flush > 1000) {
+        rangeLogger.flushToSerial();
+        last_flush = millis();
+    }
 }
 
 // =============================================================================
@@ -465,30 +460,14 @@ void handleInitCalculate() {
                       scheduler.getFrameNumber());
     neighborTable.recordRangingSuccess(session.target_id, distance_cm, rssi);
     
-    // // Print result
-    // Serial.print("[DISTANCE] ");
-    // Serial.print(TAG_ID);
-    // Serial.print(" -> ");
-    // Serial.print(session.target_id);
-    // Serial.print(": ");
-    // Serial.print(distance_cm, 1);
-    // Serial.println(" cm");
-
-    uint32_t now = millis();
-    if (now - last_live_print_ms >= LIVE_PRINT_PERIOD_MS) {
-    last_live_print_ms = now;
-
-    Serial.printf(
-        "[RANGE] %lu ms | %u -> %u | %.2f m | RSSI %.1f dBm | FP %.1f dBm\n",
-        now,
-        TAG_ID,
-        session.target_id,
-        distance_cm / 100.0f,
-        rssi,
-        fp_rssi
-    );
-}
-
+    // Print result
+    Serial.print("[DISTANCE] ");
+    Serial.print(TAG_ID);
+    Serial.print(" -> ");
+    Serial.print(session.target_id);
+    Serial.print(": ");
+    Serial.print(distance_cm, 1);
+    Serial.println(" cm");
     
     enterListeningMode();
 }

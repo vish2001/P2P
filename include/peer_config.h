@@ -60,7 +60,7 @@
 // DS-TWR PROTOCOL PARAMETERS
 // =============================================================================
 #define DS_TWR_FRAME_TYPE    0x01    // Magic byte for DS-TWR frames
-#define RESPONSE_TIMEOUT_MS  15      // Timeout waiting for response
+#define RESPONSE_TIMEOUT_MS  100      // Timeout waiting for response
 #define MAX_RANGING_RETRIES  2       // Max retries per ranging attempt
 
 // DS-TWR stages (stored in frame)
