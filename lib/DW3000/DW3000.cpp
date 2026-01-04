@@ -275,11 +275,14 @@ void DW3000Class::writeSysConfig()
   int success = 0;
   for (int i = 0; i < 100; i++)
   {
-    if (read(GEN_CFG_AES_LOW_REG, 0x0) & 0x2)
+    //if (read(GEN_CFG_AES_LOW_REG, 0x0) & 0x2)
+    // Read Register 0x00:44 (System Status) to check Bit 1 (CPLOCK)
+    if (read(GEN_CFG_AES_LOW_REG, 0x44) & 0x02)
     {
       success = 1;
       break;
     }
+    delay(1);
   }
 
   if (!success)
@@ -380,31 +383,70 @@ void DW3000Class::setupGPIO()
  @param stage Double-sided Ranging is more complicated than regular single-sided Ranging. Therefore,
               stages were introduced to make sure that the right frames get received at the right time. stage is a 3 bit int.
 */
+/*
+ Send the information that chip B collected to chip A for final time calculations
+ @param t_roundB The time that it took between chip B (this chip) sending an answer and getting a response (rx2 - tx1)
+ @param t_replyB The time that the chip took to process the received frame (tx1 - rx1)
+*/
 void DW3000Class::ds_sendFrame(int stage)
 {
+  // ---------------------------------------------------------
+  // STEP 1: WAKE UP PLL (Using RX Mode)
+  // ---------------------------------------------------------
+  // The PLL often won't lock in IDLE_RC. We force RX (0x02) to make it lock.
+  if (!(read(0x00, 0x44) & 0x02)) // If not already locked...
+  {
+      writeFastCommand(0x02); // CMD_RX (Enable Receiver -> Forces PLL On)
+      delay(1); 
+    
+      int timeout = 0;
+      while (!(read(0x00, 0x44) & 0x02)) 
+      {
+        delay(1);
+        if (timeout++ > 10) { // 50ms timeout
+           //Serial.println("[ERROR] PLL Failed to Lock (RX Kick)!");
+           writeFastCommand(0x00); // Try to return to IDLE anyway
+           break;
+        }
+      }
+      // Now that we are locked, go to IDLE to prepare for TX
+      writeFastCommand(0x00); // CMD_TXOFF (IDLE)
+  }
+
+  // ---------------------------------------------------------
+  // STEP 2: PREPARE TRANSMISSION
+  // ---------------------------------------------------------
   setMode(1);
   write(0x14, 0x01, sender & 0xFF);
   write(0x14, 0x02, destination & 0xFF);
   write(0x14, 0x03, stage & 0x7);
   setFrameLength(4);
 
-  TXInstantRX(); // Await response
+  clearSystemStatus(); 
+
+  // ---------------------------------------------------------
+  // STEP 3: SEND & WAIT
+  // ---------------------------------------------------------
+  TXInstantRX(); // Send command
 
   bool error = true;
-  for (int i = 0; i < 50; i++)
+  for (int i = 0; i < 200; i++)
   {
     if (sentFrameSucc())
     {
       error = false;
       break;
     }
-  };
+    delay(1);
+  }
+
   if (error)
   {
-    Serial.println("[ERROR] Could not send frame successfully!");
+    uint32_t status = read(0x00, 0x44); 
+    Serial.print("[ERROR] Send failed. Status: 0x");
+    Serial.println(status, HEX);
   }
 }
-
 /*
  Send the information that chip B collected to chip A for final time calculations
  @param t_roundB The time that it took between chip B (this chip) sending an answer and getting a response (rx2 - tx1)
@@ -912,8 +954,8 @@ uint32_t DW3000Class::read(int base, int sub)
 {
   uint32_t tmp;
   tmp = readOrWriteFullAddress(base, sub, 0, 0, 0);
-  if (DEBUG_OUTPUT)
-    Serial.println("");
+  // if (DEBUG_OUTPUT)
+  //   Serial.println("");
 
   return tmp;
 }

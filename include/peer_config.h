@@ -92,7 +92,7 @@
 
 // Debug output - SET TO 1 FOR DEBUGGING
 #ifndef DEBUG_OUTPUT
-#define DEBUG_OUTPUT         1       // Enable verbose debug prints
+#define DEBUG_OUTPUT         0       // Enable verbose debug prints
 #endif
 
 // =============================================================================
