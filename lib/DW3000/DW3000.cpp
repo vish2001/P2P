@@ -452,12 +452,12 @@ void DW3000Class::ds_sendFrame(int stage)
  @param t_roundB The time that it took between chip B (this chip) sending an answer and getting a response (rx2 - tx1)
  @param t_replyB The time that the chip took to process the received frame (tx1 - rx1)
 */
-void DW3000Class::ds_sendRTInfo(int t_roundB, int t_replyB)
+void DW3000Class::ds_sendRTInfo(uint32_t t_roundB, uint32_t t_replyB)
 {
   setMode(1);
-  write(0x14, 0x01, sender & 0xFF);       // sender in byte 1 (FIXED!)
-  write(0x14, 0x02, destination & 0xFF);  // dest in byte 2 (FIXED!)
-  write(0x14, 0x03, 4);  // Stage 4 = REPORT
+  write(0x14, 0x01, sender & 0xFF);
+  write(0x14, 0x02, destination & 0xFF);
+  write(0x14, 0x03, 4);
   write(0x14, 0x04, t_roundB);
   write(0x14, 0x08, t_replyB);
 
@@ -465,11 +465,11 @@ void DW3000Class::ds_sendRTInfo(int t_roundB, int t_replyB)
 
   TXInstantRX();
   
-  // Wait for TX completion (added for reliability)
-  for (int i = 0; i < 100; i++) {
-    if (sentFrameSucc()) break;
-    delay(1);
-  }
+  // // Wait for TX completion (added for reliability)
+  // for (int i = 0; i < 100; i++) {
+  //   if (sentFrameSucc()) break;
+  //   delay(1);
+  // }
 }
 
 /*
@@ -481,32 +481,27 @@ void DW3000Class::ds_sendRTInfo(int t_roundB, int t_replyB)
  @param clk_offset The calculated clock offset between both chips (See DWM3000 User Manual 10.1 for more)
  @return returns the time in units of 15.65ps that the frames were in the air on average (only one direction)
 */
-int DW3000Class::ds_processRTInfo(int t_roundA, int t_replyA, int t_roundB, int t_replyB, int clk_offset)
+int DW3000Class::ds_processRTInfo(uint32_t t_roundA, uint32_t t_replyA, uint32_t t_roundB, uint32_t t_replyB, int clk_offset)
 { // returns ranging time in DWM3000 ps units (~15.65ps per unit)
-  if (DEBUG_OUTPUT)
+if (DEBUG_OUTPUT)
   {
     Serial.println("\nProcessing Information:");
-    Serial.print("t_roundA: ");
-    Serial.println(t_roundA);
-    Serial.print("t_replyA: ");
-    Serial.println(t_replyA);
-    Serial.print("t_roundB: ");
-    Serial.println(t_roundB);
-    Serial.print("t_replyB: ");
-    Serial.println(t_replyB);
+    Serial.print("t_roundA: "); Serial.println(t_roundA);
+    Serial.print("t_replyA: "); Serial.println(t_replyA);
+    Serial.print("t_roundB: "); Serial.println(t_roundB);
+    Serial.print("t_replyB: "); Serial.println(t_replyB);
   }
 
-  int reply_diff = t_replyA - t_replyB;
+  int reply_diff = (int)(t_replyA - t_replyB);
 
   long double clock_offset = t_replyA > t_replyB ? 1.0 + getClockOffset(clk_offset) : 1.0 - getClockOffset(clk_offset);
 
-  int first_rt = t_roundA - t_replyB;
-  int second_rt = t_roundB - t_replyA;
+  int first_rt = (int)(t_roundA - t_replyB);
+  int second_rt = (int)(t_roundB - t_replyA);
 
   int combined_rt = (first_rt + second_rt - (reply_diff - (reply_diff * clock_offset))) / 2;
-  int combined_rt_raw = (first_rt + second_rt) / 2;
 
-  return combined_rt / 2; // divided by 2 to get just one range
+  return combined_rt / 2;
 }
 
 /*
@@ -899,9 +894,8 @@ float DW3000Class::getTempInC()
 */
 unsigned long long DW3000Class::readRXTimestamp()
 {
-  uint32_t ts_low = read(0x0C, 0x00);
-  unsigned long long ts_high = read(0x0C, 0x04) & 0xFF;
-
+  uint32_t ts_low = read(0x00, 0x64);
+  unsigned long long ts_high = read(0x00, 0x68) & 0xFF;
   unsigned long long rx_timestamp = (ts_high << 32) | ts_low;
 
   return rx_timestamp;

@@ -18,8 +18,8 @@ public:
 
   // Double-Sided Ranging
   static void ds_sendFrame(int stage);
-  static void ds_sendRTInfo(int t_roundB, int t_replyB);
-  static int ds_processRTInfo(int t_roundA, int t_replyA, int t_roundB, int t_replyB, int clock_offset);
+  static void ds_sendRTInfo(uint32_t t_roundB, uint32_t t_replyB);
+  static int ds_processRTInfo(uint32_t t_roundA, uint32_t t_replyA, uint32_t t_roundB, uint32_t t_replyB, int clock_offset);
   static int ds_getStage();
   static bool ds_isErrorFrame();
   static void ds_sendErrorFrame();

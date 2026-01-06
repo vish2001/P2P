@@ -145,17 +145,36 @@ uint8_t NeighborTable::selectKNeighbors(SelectedNeighbor* out_neighbors, uint8_t
 }
 
 uint8_t NeighborTable::getNextRangingTarget() {
-    if (selected_count == 0) {
-        // Re-select neighbors
-        selectKNeighbors(selected, K_NEIGHBORS);
-        if (selected_count == 0) {
-            return 0; // No neighbors available
-        }
+    // Simple approach: find ALL eligible neighbors, cycle through them
+    uint8_t eligible[MAX_NEIGHBORS];
+    uint8_t eligible_count = 0;
+    
+    // Prune stale neighbors first
+    pruneStaleNeighbors();
+    
+    // Collect all neighbors with enough HELLOs
+    for (int i = 0; i < MAX_NEIGHBORS; i++) {
+        if (!neighbors[i].active) continue;
+        if (neighbors[i].hello_count < MIN_HELLO_COUNT) continue;
+        eligible[eligible_count++] = neighbors[i].id;
     }
     
-    // Round-robin through selected neighbors
-    uint8_t target = selected[current_ranging_index].id;
-    current_ranging_index = (current_ranging_index + 1) % selected_count;
+    if (eligible_count == 0) {
+        return 0;  // No neighbors
+    }
+    
+    // Simple round-robin using static index
+    static uint8_t rr_index = 0;
+    rr_index = rr_index % eligible_count;
+    
+    uint8_t target = eligible[rr_index];
+    rr_index = (rr_index + 1) % eligible_count;
+    
+    // Debug output
+    Serial.print("[RR] ");
+    Serial.print(eligible_count);
+    Serial.print(" neighbors, picking ");
+    Serial.println(target);
     
     return target;
 }
