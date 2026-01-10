@@ -25,7 +25,33 @@
 #ifndef TAG_ID
 #define TAG_ID  1
 #endif
+// =============================================================================
+// COMMUNICATION SELECTION (Choose ESP-NOW or WiFi)
+// =============================================================================
+#define ESP_NOW_ENABLED      1                    // 1 = Use ESP-NOW (energy efficient)
+#define WIFI_ENABLED         0                    // 1 = Use WiFi UDP (legacy)
 
+// =============================================================================
+// ESP-NOW CONFIGURATION (if ESP_NOW_ENABLED = 1)  
+// =============================================================================
+#define BASE_STATION_MAC     {0xA8, 0x03, 0x2A, 0xF7, 0x0C, 0x88}  // Matches A8:03:2A:F7:0C:88
+#define ESP_NOW_MIN_INTERVAL 100                  // Min ms between sends
+
+// =============================================================================
+// WIFI UDP CONFIGURATION (if WIFI_ENABLED = 1)
+// =============================================================================
+// #define WIFI_SSID            "WiFi 11-13"     // Your WiFi network name
+// #define WIFI_PASSWORD        "b4yQANDJ"     // Your WiFi password
+// #define UDP_SERVER_IP        "192.168.88.251"      // Your laptop's IP address
+// #define UDP_SERVER_PORT      5000                 // UDP port to send to
+// #define UDP_SEND_INTERVAL_MS 100                  // Min interval between UDP sends
+// =============================================================================
+// ENERGY EFFICIENCY SETTINGS  
+// =============================================================================
+#define REDUCE_CPU_FREQ      1                    // 1 = Reduce CPU freq when idle
+#define CPU_FREQ_HIGH        240                  // MHz during ranging
+#define CPU_FREQ_NORMAL      160                  // MHz normal operation
+#define CPU_FREQ_LOW         80                   // MHz during idle
 // =============================================================================
 // TDMA TIMING PARAMETERS
 // =============================================================================

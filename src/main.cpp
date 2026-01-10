@@ -20,6 +20,16 @@
 #include "tdma_scheduler.h"
 #include "range_logger.h"
 
+// WiFi UDP for sending data to central station
+#if WIFI_ENABLED
+#include "wifi_udp_sender.h"
+#endif
+
+// ESP-NOW for energy-efficient communication
+#if ESP_NOW_ENABLED  
+#include "espnow_sender.h"
+#endif
+
 // =============================================================================
 // GLOBAL STATE
 // =============================================================================
@@ -60,15 +70,18 @@ struct RangingSession {
     long long tx_poll;
     long long rx_resp;
     long long tx_final;
-    int t_round_a;
-    int t_reply_a;
+    uint32_t t_round_a;
+    uint32_t t_reply_a;
     int clock_offset;
     bool is_initiator;
     long long rx_poll;
     long long tx_resp;
     long long rx_final;
-    int t_round_b;
-    int t_reply_b;
+    uint32_t t_round_b;
+    uint32_t t_reply_b;
+    // Fields to store REPORT data (read before clearSystemStatus)
+    uint32_t report_t_round_b;
+    uint32_t report_t_reply_b;
 } session;
 
 // HELLO beacon sequence number
@@ -130,6 +143,22 @@ void setup() {
     Serial.println(DEBUG_OUTPUT ? "ON" : "OFF");
     Serial.println("==========================================\n");
     
+    // Initialize communication layer
+    #if ESP_NOW_ENABLED
+    Serial.println("[ESP-NOW] Initializing ESP-NOW communication...");
+    espnowSender.begin();
+    // Set normal CPU frequency for power saving
+    if (REDUCE_CPU_FREQ) {
+        setCpuFrequencyMhz(CPU_FREQ_NORMAL);
+        Serial.print("[CPU] Frequency set to ");
+        Serial.print(CPU_FREQ_NORMAL);
+        Serial.println(" MHz");
+    }
+    #elif WIFI_ENABLED
+    Serial.println("[WIFI] Initializing WiFi UDP sender...");
+    wifiSender.begin();
+    #endif
+    
     // Initialize UWB hardware
     initializeUWB();
     
@@ -147,6 +176,21 @@ void setup() {
 // MAIN LOOP
 // =============================================================================
 void loop() {
+    // Check communication connection periodically
+    #if ESP_NOW_ENABLED
+    static uint32_t last_conn_check = 0;
+    if (millis() - last_conn_check > 5000) {
+        last_conn_check = millis();
+        espnowSender.checkConnection();
+    }
+    #elif WIFI_ENABLED
+    static uint32_t last_wifi_check = 0;
+    if (millis() - last_wifi_check > 1000) {
+        last_wifi_check = millis();
+        wifiSender.checkConnection();
+    }
+    #endif
+    
     // Update scheduler timing
     scheduler.update();
     
@@ -220,6 +264,12 @@ void handleListeningState() {
         if (target != 0) {
             session.target_id = target;
             session.is_initiator = true;
+            
+            // Increase CPU frequency for accurate ranging
+            if (REDUCE_CPU_FREQ) {
+                setCpuFrequencyMhz(CPU_FREQ_HIGH);
+            }
+            
             Serial.print("[STATE] -> INIT_SEND_POLL to node ");
             Serial.println(target);
             transitionTo(NodeState::INIT_SEND_POLL);
@@ -272,6 +322,7 @@ void processReceivedFrame() {
     uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
     uint8_t dest_id = uwb.read(RX_BUFFER_0_REG, 0x02) & 0xFF;
     uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
+    unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
     
     Serial.print("[RX] m=");
     Serial.print(mode);
@@ -301,15 +352,32 @@ void processReceivedFrame() {
             // Add to neighbor table
             neighborTable.processHello(sender_id, 0, 100);
             
-            // Sync to lower-ID nodes
+            // Sync ONLY to the LOWEST ID neighbor (prevents sync thrashing)
             #if SYNC_TO_LOWER_ID
+            static uint8_t sync_master_id = 0;  // Track who we're syncing to
+            
             if (sender_id < TAG_ID) {
-                uint8_t sender_slot = sender_id % NUM_SLOTS;
-                uint32_t now = millis();
-                uint32_t estimated_frame_start = now - (sender_slot * SLOT_LENGTH_MS) - (SLOT_LENGTH_MS / 2);
-                scheduler.syncFrameStart(estimated_frame_start);
-                Serial.print("[SYNC] To node ");
-                Serial.println(sender_id);
+                // Update sync master to lowest ID seen
+                if (sync_master_id == 0 || sender_id < sync_master_id) {
+                    sync_master_id = sender_id;
+                    Serial.print("[SYNC] New master: ");
+                    Serial.println(sync_master_id);
+                }
+                
+                // Only sync if this is THE lowest ID neighbor (the sync master)
+                if (sender_id == sync_master_id) {
+                    uint8_t sender_slot = sender_id % NUM_SLOTS;
+                    uint32_t now = millis();
+                    uint32_t estimated_frame_start = now - (sender_slot * SLOT_LENGTH_MS) - (SLOT_LENGTH_MS / 2);
+                    scheduler.syncFrameStart(estimated_frame_start);
+                    // Only print occasionally to reduce spam
+                    static uint32_t last_sync_print = 0;
+                    if (now - last_sync_print > 5000) {
+                        Serial.print("[SYNC] To node ");
+                        Serial.println(sender_id);
+                        last_sync_print = now;
+                    }
+                }
             }
             #endif
             
@@ -324,7 +392,7 @@ void processReceivedFrame() {
             
             session.target_id = sender_id;
             session.is_initiator = false;
-            session.rx_poll = uwb.readRXTimestamp();
+            session.rx_poll = rx_ts;  // Use captured timestamp
             
             scheduler.enterRespondingMode();
             transitionTo(NodeState::RESP_SEND_RESP);
@@ -378,11 +446,12 @@ void handleInitWaitResp() {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
+        unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
         
         uwb.clearSystemStatus();
         
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_RESP) {
-            session.rx_resp = uwb.readRXTimestamp();
+            session.rx_resp = rx_ts;
             session.t_round_a = session.rx_resp - session.tx_poll;
             retry_count = 0;
             
@@ -422,15 +491,29 @@ void handleInitWaitReport() {
     if (rx_status == 1) {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
+        uint8_t dest_id = uwb.read(RX_BUFFER_0_REG, 0x02) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
         
-        uwb.clearSystemStatus();
+        // Debug print received frame
+        Serial.print("[RX-RPT] from=");
+        Serial.print(sender_id);
+        Serial.print(" to=");
+        Serial.print(dest_id);
+        Serial.print(" stg=");
+        Serial.println(stage);
         
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_REPORT) {
+            // Read timing data from REPORT payload BEFORE clearing status!
+            session.report_t_round_b = uwb.read(RX_BUFFER_0_REG, 0x04);
+            session.report_t_reply_b = uwb.read(RX_BUFFER_0_REG, 0x08);
             session.clock_offset = uwb.getRawClockOffset();
+            
+            uwb.clearSystemStatus();
+            
             Serial.println("[REPORT] Received");
             transitionTo(NodeState::INIT_CALCULATE);
         } else {
+            uwb.clearSystemStatus();
             uwb.standardRX();
         }
     } else if (rx_status == 2) {
@@ -440,9 +523,9 @@ void handleInitWaitReport() {
 }
 
 void handleInitCalculate() {
-    // Read timing info from REPORT payload
-    int t_round_b = uwb.read(RX_BUFFER_0_REG, 0x04);
-    int t_reply_b = uwb.read(RX_BUFFER_0_REG, 0x08);
+    // Use timing info already read in handleInitWaitReport
+    uint32_t t_round_b = session.report_t_round_b;
+    uint32_t t_reply_b = session.report_t_reply_b;
     
     // Calculate distance
     int ranging_time = uwb.ds_processRTInfo(
@@ -459,6 +542,13 @@ void handleInitCalculate() {
     LOG_RANGE_SUCCESS(TAG_ID, session.target_id, distance_cm, rssi, fp_rssi, 
                       scheduler.getFrameNumber());
     neighborTable.recordRangingSuccess(session.target_id, distance_cm, rssi);
+    
+    // Send to central station via ESP-NOW or WiFi
+    #if ESP_NOW_ENABLED
+    espnowSender.sendRangingResult(TAG_ID, session.target_id, distance_cm, rssi, millis());
+    #elif WIFI_ENABLED
+    wifiSender.sendRangingResult(TAG_ID, session.target_id, distance_cm, rssi, millis());
+    #endif
     
     // Print result
     Serial.print("[DISTANCE] ");
@@ -503,11 +593,12 @@ void handleRespWaitFinal() {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
+        unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
         
         uwb.clearSystemStatus();
         
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_FINAL) {
-            session.rx_final = uwb.readRXTimestamp();
+            session.rx_final = rx_ts;
             session.t_round_b = session.rx_final - session.tx_resp;
             
             Serial.println("[FINAL] Received");
@@ -522,6 +613,10 @@ void handleRespWaitFinal() {
 }
 
 void handleRespSendReport() {
+    // CRITICAL: Set sender/destination before sending REPORT
+    uwb.setSenderID(TAG_ID);
+    uwb.setDestinationID(session.target_id);
+    
     // Send REPORT with timing info using driver's method
     uwb.ds_sendRTInfo(session.t_round_b, session.t_reply_b);
     
@@ -548,6 +643,11 @@ void enterListeningMode() {
     state_entry_time = millis();
     uwb.clearSystemStatus();
     uwb.standardRX();
+    
+    // Restore normal CPU frequency for power saving
+    if (REDUCE_CPU_FREQ) {
+        setCpuFrequencyMhz(CPU_FREQ_NORMAL);
+    }
 }
 
 // =============================================================================
