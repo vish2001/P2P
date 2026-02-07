@@ -3,40 +3,44 @@
 #include "peer_config.h"
 
 // =============================================================================
-// TDMA SCHEDULER
+// SCALABLE TDMA SCHEDULER
 // =============================================================================
-// Deterministic time-division multiple access for collision-free ranging
-// 
-// Key principle: my_slot = TAG_ID % NUM_SLOTS
-// - In MY slot: I am allowed to INITIATE ranging
-// - In OTHER slots: I may only RESPOND to ranging requests
-//
-// Synchronization: Nodes sync their frame timing to lower-ID neighbors
+// Enhanced for dynamic ID assignment and collision mitigation
 // =============================================================================
 
-// Slot timing info
 struct SlotInfo {
-    uint8_t current_slot;          // Which slot we're in (0 to NUM_SLOTS-1)
-    uint32_t slot_start_ms;        // millis() when current slot started
-    uint32_t slot_elapsed_ms;      // How long into current slot
-    uint32_t slot_remaining_ms;    // Time remaining in current slot
-    bool is_my_slot;               // True if current_slot == MY_SLOT
-    uint32_t frame_start_ms;       // millis() when current frame started
-    uint16_t frame_number;         // Incrementing frame counter
+    uint32_t frame_start_ms;
+    uint16_t frame_number;
+    uint8_t current_slot;
+    uint32_t slot_start_ms;
+    uint32_t slot_elapsed_ms;
+    uint32_t slot_remaining_ms;
+    bool is_my_slot;
 };
 
 class TDMAScheduler {
 public:
     TDMAScheduler();
     
-    // --- Core Functions ---
+    // --- Core Update ---
     void update();
+    void recalculateSlot();  // Call after TAG_ID changes
+    
+    // --- Slot Information ---
+    uint8_t calculateCurrentSlot();
     SlotInfo getSlotInfo();
+    uint8_t getMySlot();
+    
+    // --- Initiation Control ---
     bool canInitiateRanging();
+    bool shouldAddJitter();
+    uint8_t getJitterDelay();
+    
+    // --- HELLO Timing ---
     bool shouldSendHello();
     void markHelloSent();
     
-    // --- State Management ---
+    // --- Responding State ---
     void enterRespondingMode();
     void exitRespondingMode();
     bool isResponding();
@@ -51,6 +55,11 @@ public:
     uint16_t getFrameNumber();
     uint32_t getFrameStart();
     
+    // --- Collision Handling ---
+    void reportCollision();
+    uint8_t getCollisionBackoff();
+    bool shouldSkipSlot();
+    
     // --- Debug ---
     void printStatus();
 
@@ -62,10 +71,14 @@ private:
     bool responding;
     bool hello_pending;
     bool synced;
+    uint8_t my_slot;  // Cached slot value
     
-    uint8_t calculateCurrentSlot();
+    // Collision mitigation
+    uint8_t collision_count;
+    uint32_t last_collision_ms;
+    bool skip_next_slot;
+    
     void checkFrameRollover();
 };
 
-// Global scheduler instance
 extern TDMAScheduler scheduler;

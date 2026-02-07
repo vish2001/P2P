@@ -2,10 +2,10 @@
 #include <Arduino.h>
 
 // =============================================================================
-// PEER-TO-PEER UWB LOCALIZATION SYSTEM - CONFIGURATION
+// PEER-TO-PEER UWB MESH SYSTEM - SCALABLE CONFIGURATION
 // =============================================================================
-// All nodes are identical peers. No anchors, no tags, no coordinator.
-// Deterministic TDMA slot ownership: my_slot = tag_id % NUM_SLOTS
+// ALL NODES ARE IDENTICAL PEERS. No anchors, no tags, no coordinator.
+// Positions are computed as RELATIVE coordinates within the mesh.
 // =============================================================================
 
 // --- Hardware Pin Mapping (ESP32 + DW3000) ---
@@ -18,78 +18,100 @@
 #define LED_PIN    2
 
 // =============================================================================
-// NODE IDENTITY
+// NODE IDENTITY - AUTO-ADDRESSING
 // =============================================================================
-// Each physical device must have a unique TAG_ID (0-255)
-// Can be overridden via build flags: -DTAG_ID=X
-#ifndef TAG_ID
-#define TAG_ID  1
+// TAG_ID is generated automatically from MAC address at startup.
+// Can be overridden via build flags for testing: -DTAG_ID_OVERRIDE=X
+#ifndef TAG_ID_OVERRIDE
+#define TAG_ID_OVERRIDE 0   // 0 = auto-assign from MAC
 #endif
-// =============================================================================
-// COMMUNICATION SELECTION (Choose ESP-NOW or WiFi)
-// =============================================================================
-#define ESP_NOW_ENABLED      1                    // 1 = Use ESP-NOW (energy efficient)
-#define WIFI_ENABLED         0                    // 1 = Use WiFi UDP (legacy)
+
+// Global variable declaration (defined in main.cpp)
+extern uint8_t TAG_ID;
 
 // =============================================================================
-// ESP-NOW CONFIGURATION (if ESP_NOW_ENABLED = 1)  
+// COMMUNICATION SELECTION
 // =============================================================================
-#define BASE_STATION_MAC     {0xA8, 0x03, 0x2A, 0xF7, 0x0C, 0x88}  // Matches A8:03:2A:F7:0C:88
-#define ESP_NOW_MIN_INTERVAL 100                  // Min ms between sends
+#define ESP_NOW_ENABLED      1
+#define WIFI_ENABLED         0
 
 // =============================================================================
-// WIFI UDP CONFIGURATION (if WIFI_ENABLED = 1)
+// ESP-NOW CONFIGURATION
 // =============================================================================
-// #define WIFI_SSID            "WiFi 11-13"     // Your WiFi network name
-// #define WIFI_PASSWORD        "b4yQANDJ"     // Your WiFi password
-// #define UDP_SERVER_IP        "192.168.88.251"      // Your laptop's IP address
-// #define UDP_SERVER_PORT      5000                 // UDP port to send to
-// #define UDP_SEND_INTERVAL_MS 100                  // Min interval between UDP sends
-// =============================================================================
-// ENERGY EFFICIENCY SETTINGS  
-// =============================================================================
-#define REDUCE_CPU_FREQ      1                    // 1 = Reduce CPU freq when idle
-#define CPU_FREQ_HIGH        240                  // MHz during ranging
-#define CPU_FREQ_NORMAL      160                  // MHz normal operation
-#define CPU_FREQ_LOW         80                   // MHz during idle
-// =============================================================================
-// TDMA TIMING PARAMETERS
-// =============================================================================
-#define FRAME_LENGTH_MS      1000    // Total frame duration (ms)
-#define NUM_SLOTS            8       // Number of TDMA slots per frame
-#define SLOT_LENGTH_MS       (FRAME_LENGTH_MS / NUM_SLOTS)  // 125ms per slot
+#define BASE_STATION_MAC     {0xA8, 0x03, 0x2A, 0xF7, 0x0C, 0x88}
+#define ESP_NOW_MIN_INTERVAL 100
 
-// Slot ownership: deterministic, no negotiation
-#define MY_SLOT              (TAG_ID % NUM_SLOTS)
+// =============================================================================
+// ENERGY EFFICIENCY
+// =============================================================================
+#define REDUCE_CPU_FREQ      1
+#define CPU_FREQ_HIGH        240
+#define CPU_FREQ_NORMAL      160
+#define CPU_FREQ_LOW         80
+
+// =============================================================================
+// SCALABLE TDMA TIMING
+// =============================================================================
+// Prime number of slots minimizes hash collisions.
+// With 53 slots, IDs must differ by exactly 53 to collide.
+#define NUM_SLOTS            53
+
+// Minimum slot for DS-TWR: Poll + Resp + Final + Report + processing
+#define MIN_SLOT_MS          25
+
+// Frame timing derived from physics
+#define SLOT_LENGTH_MS       MIN_SLOT_MS
+#define FRAME_LENGTH_MS      (NUM_SLOTS * SLOT_LENGTH_MS)  // 1325ms
+
+// Slot ownership computed at runtime (TAG_ID is variable)
+#define COMPUTE_MY_SLOT()    (TAG_ID % NUM_SLOTS)
+
+// =============================================================================
+// COLLISION MITIGATION
+// =============================================================================
+#define SLOT_JITTER_MAX_MS   8
+#define COLLISION_BACKOFF_MS 50
 
 // =============================================================================
 // HELLO BEACON PARAMETERS
 // =============================================================================
-#define HELLO_INTERVAL_MS    2000    // Broadcast HELLO every 2 seconds
-#define HELLO_FRAME_TYPE     0xAA    // Magic byte to identify HELLO frames
-#define NEIGHBOR_TIMEOUT_MS  10000   // Remove neighbor if no HELLO for 10s
+#define HELLO_INTERVAL_MS    3000
+#define HELLO_FRAME_TYPE     0xAA
+#define NEIGHBOR_TIMEOUT_MS  15000
+#define HELLO_JITTER_MS      500
 
 // =============================================================================
 // FRAME SYNCHRONIZATION
 // =============================================================================
-#define SYNC_TO_LOWER_ID     1       // Sync frame timing to lower-ID nodes
-#define SYNC_HOLDOFF_MS      5000    // Don't re-sync within this window
+#define SYNC_TO_LOWER_ID     1
+#define SYNC_HOLDOFF_MS      5000
 
 // =============================================================================
 // NEIGHBOR MANAGEMENT
 // =============================================================================
-#define MAX_NEIGHBORS        16      // Maximum neighbors to track
-#define K_NEIGHBORS          4       // Number of neighbors to range with
-#define MIN_HELLO_COUNT      2       // Minimum HELLOs before considering for ranging
+#define MAX_NEIGHBORS        32
+#define K_NEIGHBORS          6
+#define MIN_HELLO_COUNT      2
+
+// Bridge detection (for prioritizing long-distance mesh links)
+#define CLUSTER_DISTANCE_THRESHOLD_CM  1500
+#define BRIDGE_LINK_PRIORITY_BOOST     50.0
 
 // =============================================================================
-// DS-TWR PROTOCOL PARAMETERS
+// CONNECTIVITY PRESERVATION
 // =============================================================================
-#define DS_TWR_FRAME_TYPE    0x01    // Magic byte for DS-TWR frames
-#define RESPONSE_TIMEOUT_MS  30      // Timeout waiting for response
-#define MAX_RANGING_RETRIES  2       // Max retries per ranging attempt
+// Range with ALL neighbors to maintain mesh connectivity
+#define RANGE_ALL_NEIGHBORS  1
+#define STALE_LINK_PRIORITY  100.0
+#define LINK_STALE_THRESHOLD_MS  10000
 
-// DS-TWR stages (stored in frame)
+// =============================================================================
+// DS-TWR PROTOCOL
+// =============================================================================
+#define DS_TWR_FRAME_TYPE    0x01
+#define RESPONSE_TIMEOUT_MS  35
+#define MAX_RANGING_RETRIES  2
+
 #define STAGE_POLL           1
 #define STAGE_RESP           2
 #define STAGE_FINAL          3
@@ -97,34 +119,38 @@
 #define STAGE_ERROR          7
 
 // =============================================================================
-// LISTEN-BEFORE-TALK (Collision Avoidance)
+// LISTEN-BEFORE-TALK
 // =============================================================================
-#define LBT_LISTEN_MS        3       // Listen for activity before transmitting
-#define LBT_BACKOFF_MS       10      // Backoff if channel busy
+#define LBT_ENABLED          1
+#define LBT_LISTEN_MS        5
+#define LBT_BACKOFF_BASE_MS  10
+#define LBT_BACKOFF_MAX_MS   50
+#define LBT_MAX_RETRIES      3
 
 // =============================================================================
 // DISTANCE FILTERING
 // =============================================================================
-#define FILTER_SIZE          5       // Median filter window (last N ranges)
-#define MIN_DISTANCE_CM      0.0     // Minimum valid distance
-#define MAX_DISTANCE_CM      5000.0  // Maximum valid distance (50m)
-#define OUTLIER_THRESHOLD    100.0   // Reject jumps > 1m
+#define FILTER_SIZE          7
+#define MIN_DISTANCE_CM      10.0
+#define MAX_DISTANCE_CM      10000.0
+#define MAX_ACCEPT_DISTANCE_CM  3000.0   // Ignore measurements beyond 30m (less reliable)
+#define OUTLIER_THRESHOLD    200.0
+#define EMA_ALPHA            0.3
 
 // =============================================================================
 // LOGGING & DEBUG
 // =============================================================================
-#define LOG_BUFFER_SIZE      32      // Number of log entries to buffer
-#define SERIAL_BAUD          921600  // Serial output baud rate
+#define LOG_BUFFER_SIZE      32
+#define SERIAL_BAUD          921600
 
-// Debug output - SET TO 1 FOR DEBUGGING
 #ifndef DEBUG_OUTPUT
-#define DEBUG_OUTPUT         0       // Enable verbose debug prints
+#define DEBUG_OUTPUT         0
 #endif
 
 // =============================================================================
 // ANTENNA CALIBRATION
 // =============================================================================
-#define ANTENNA_DELAY_DEFAULT 16350  // Default antenna delay
+#define ANTENNA_DELAY_DEFAULT 16350
 
 // =============================================================================
 // DW3000 RADIO CONSTANTS
@@ -170,12 +196,10 @@
 #define PHR_RATE_6_8MB 0x1
 #define PHR_RATE_850KB 0x0
 
-// Masks
 #define SPIRDY_MASK 0x80
 #define RCINIT_MASK 0x100
 #define BIAS_CTRL_BIAS_MASK 0x1F
 
-// Registers
 #define GEN_CFG_AES_LOW_REG 0x00
 #define GEN_CFG_AES_HIGH_REG 0x01
 #define STS_CFG_REG 0x2
@@ -217,7 +241,7 @@
 #define NO_OFFSET 0x0
 
 // =============================================================================
-// GLOBAL STATE VARIABLES (externed, defined in main)
+// GLOBAL STATE VARIABLES
 // =============================================================================
 extern int ANTENNA_DELAY;
 extern int led_status;

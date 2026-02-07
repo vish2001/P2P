@@ -1,15 +1,8 @@
 // =============================================================================
-// PEER-TO-PEER UWB RANGING SYSTEM
+// PEER-TO-PEER UWB MESH SYSTEM
 // =============================================================================
-// Unified firmware for all nodes. Each node is an identical peer.
-// No anchors, no tags, no coordinator.
-//
-// Key behaviors:
-// - Deterministic TDMA slot: my_slot = TAG_ID % NUM_SLOTS
-// - In MY slot: initiate DS-TWR to one K-neighbor
-// - In OTHER slots: respond to incoming DS-TWR requests
-// - HELLO beacons broadcast every ~2s for neighbor discovery
-// - Frame sync: align timing to lower-ID neighbors
+// ALL NODES ARE IDENTICAL PEERS. No anchors, no tags, no coordinator.
+// Positions are computed centrally as RELATIVE coordinates.
 // =============================================================================
 
 #include <Arduino.h>
@@ -20,12 +13,10 @@
 #include "tdma_scheduler.h"
 #include "range_logger.h"
 
-// WiFi UDP for sending data to central station
 #if WIFI_ENABLED
 #include "wifi_udp_sender.h"
 #endif
 
-// ESP-NOW for energy-efficient communication
 #if ESP_NOW_ENABLED  
 #include "espnow_sender.h"
 #endif
@@ -34,16 +25,19 @@
 // GLOBAL STATE
 // =============================================================================
 
-// DW3000 driver instance
+// TAG_ID - auto-generated from MAC
+uint8_t TAG_ID = 1;
+
+// DW3000 driver
 DW3000Class uwb;
 
-// Global variables required by DW3000 driver
+// Required by driver
 int ANTENNA_DELAY = ANTENNA_DELAY_DEFAULT;
 int led_status = 0;
 int destination = 0;
 int sender = 0;
 
-// State machine states
+// State machine
 enum class NodeState {
     LISTENING,
     INIT_SEND_POLL,
@@ -57,14 +51,11 @@ enum class NodeState {
     HELLO_SEND,
 };
 
-// Current state
 NodeState state = NodeState::LISTENING;
-
-// Timing for state machine
 uint32_t state_entry_time = 0;
 uint8_t retry_count = 0;
 
-// Current ranging session data
+// Ranging session
 struct RangingSession {
     uint8_t target_id;
     long long tx_poll;
@@ -79,24 +70,14 @@ struct RangingSession {
     long long rx_final;
     uint32_t t_round_b;
     uint32_t t_reply_b;
-    // Fields to store REPORT data (read before clearSystemStatus)
     uint32_t report_t_round_b;
     uint32_t report_t_reply_b;
 } session;
 
-// HELLO beacon sequence number
 uint8_t hello_seq = 0;
+uint8_t lbt_retries = 0;
 
-// =============================================================================
-// FRAME FORMAT
-// =============================================================================
-// We use the DW3000 driver's existing frame structure:
-// Byte 0: Mode/Type (we use 0 for standard, 1 for DS-TWR)
-// Byte 1: Sender ID
-// Byte 2: Destination ID
-// Byte 3: Stage/Sequence
-
-#define BROADCAST_ID         0xFF
+#define BROADCAST_ID 0xFF
 
 // =============================================================================
 // FORWARD DECLARATIONS
@@ -104,8 +85,8 @@ uint8_t hello_seq = 0;
 void initializeUWB();
 void resetRadio();
 void hardResetDW();
-
-void processReceivedFrame();
+void generateNodeID();
+bool performLBT();
 bool checkStateTimeout(uint32_t timeout_ms);
 void transitionTo(NodeState new_state);
 void enterListeningMode();
@@ -124,122 +105,204 @@ void handleHelloSend();
 void printStatus();
 
 // =============================================================================
+// AUTO-ADDRESSING FROM MAC
+// =============================================================================
+void generateNodeID() {
+#if TAG_ID_OVERRIDE > 0
+    TAG_ID = TAG_ID_OVERRIDE;
+    Serial.print("[ID] Override: ");
+    Serial.println(TAG_ID);
+#else
+    // Get full MAC address
+    uint64_t mac = ESP.getEfuseMac();
+    
+    // Print MAC for debugging
+    Serial.print("[MAC] ");
+    for (int i = 0; i < 6; i++) {
+        uint8_t byte = (mac >> (i * 8)) & 0xFF;
+        if (byte < 0x10) Serial.print("0");
+        Serial.print(byte, HEX);
+        if (i < 5) Serial.print(":");
+    }
+    Serial.println();
+    
+    // FNV-1a hash for better distribution
+    uint32_t hash = 2166136261;  // FNV offset basis
+    for (int i = 0; i < 6; i++) {
+        uint8_t byte = (mac >> (i * 8)) & 0xFF;
+        hash ^= byte;
+        hash *= 16777619;  // FNV prime
+    }
+    
+    // Map to 1-254 range
+    uint8_t id = (hash % 253) + 1;  // Results in 1-253
+    
+    TAG_ID = id;
+    Serial.print("[ID] Auto-generated: ");
+    Serial.println(TAG_ID);
+#endif
+    
+    Serial.print("[SLOT] ");
+    Serial.print(TAG_ID % NUM_SLOTS);
+    Serial.print(" / ");
+    Serial.println(NUM_SLOTS - 1);
+    
+    scheduler.recalculateSlot();
+}
+
+// =============================================================================
 // SETUP
 // =============================================================================
 void setup() {
     Serial.begin(SERIAL_BAUD);
-    delay(500);  // Wait for serial
+    delay(500);
     
     Serial.println("\n==========================================");
-    Serial.println("  PEER-TO-PEER UWB RANGING SYSTEM v2");
+    Serial.println("  P2P UWB MESH - All Nodes Equal");
     Serial.println("==========================================");
-    Serial.print("Node ID: ");
-    Serial.println(TAG_ID);
-    Serial.print("TDMA Slot: ");
-    Serial.print(MY_SLOT);
-    Serial.print(" / ");
-    Serial.println(NUM_SLOTS - 1);
-    Serial.print("Debug: ");
-    Serial.println(DEBUG_OUTPUT ? "ON" : "OFF");
+    
+    generateNodeID();
+    
+    Serial.print("Slot: ");
+    Serial.print(scheduler.getMySlot());
+    Serial.print("/");
+    Serial.print(NUM_SLOTS - 1);
+    Serial.print(" | Frame: ");
+    Serial.print(FRAME_LENGTH_MS);
+    Serial.println("ms");
     Serial.println("==========================================\n");
     
-    // Initialize communication layer
-    #if ESP_NOW_ENABLED
-    Serial.println("[ESP-NOW] Initializing ESP-NOW communication...");
+    randomSeed(TAG_ID * 1000 + millis());
+    
+#if ESP_NOW_ENABLED
+    Serial.println("[COMM] ESP-NOW init...");
     espnowSender.begin();
-    // Set normal CPU frequency for power saving
     if (REDUCE_CPU_FREQ) {
         setCpuFrequencyMhz(CPU_FREQ_NORMAL);
-        Serial.print("[CPU] Frequency set to ");
-        Serial.print(CPU_FREQ_NORMAL);
-        Serial.println(" MHz");
     }
-    #elif WIFI_ENABLED
-    Serial.println("[WIFI] Initializing WiFi UDP sender...");
+#elif WIFI_ENABLED
+    Serial.println("[COMM] WiFi init...");
     wifiSender.begin();
-    #endif
+#endif
     
-    // Initialize UWB hardware
     initializeUWB();
     
-    // Configure logger
     rangeLogger.setVerbose(true);
     rangeLogger.setJsonOutput(false);
     
-    // Start in listening mode
     enterListeningMode();
     
-    Serial.println("[INFO] Setup complete. Starting main loop.\n");
+    Serial.println("[MESH] Ready\n");
+}
+
+// =============================================================================
+// BROADCAST NEIGHBOR TABLE TO BASE STATION
+// =============================================================================
+void broadcastNeighborTable() {
+    uint8_t count = neighborTable.getActiveCount();
+    
+    // Send heartbeat first
+#if ESP_NOW_ENABLED
+    espnowSender.sendHeartbeat(TAG_ID, scheduler.getFrameNumber(), count, millis());
+#elif WIFI_ENABLED
+    wifiSender.sendHeartbeat(TAG_ID, scheduler.getFrameNumber(), count, millis());
+#endif
+    
+    // Get neighbor array and iterate through active entries
+    const Neighbor* neighbors = neighborTable.getNeighborArray();
+    
+    for (uint8_t i = 0; i < MAX_NEIGHBORS; i++) {
+        const Neighbor& n = neighbors[i];
+        if (!n.active) continue;
+        
+        // Calculate ranging success percentage
+        uint8_t range_pct = 0;
+        if (n.ranging_attempts > 0) {
+            range_pct = (n.ranging_successes * 100) / n.ranging_attempts;
+        }
+        
+#if ESP_NOW_ENABLED
+        espnowSender.sendNeighborInfo(
+            TAG_ID,
+            n.id,
+            n.hello_count,
+            range_pct,
+            n.filtered_distance_cm,
+            n.avg_rssi
+        );
+#elif WIFI_ENABLED
+        wifiSender.sendNeighborInfo(
+            TAG_ID,
+            n.id,
+            n.hello_count,
+            range_pct,
+            n.filtered_distance_cm,
+            n.avg_rssi
+        );
+#endif
+        
+        delay(5);  // Small delay between packets to avoid flooding
+    }
 }
 
 // =============================================================================
 // MAIN LOOP
 // =============================================================================
 void loop() {
-    // Check communication connection periodically
-    #if ESP_NOW_ENABLED
-    static uint32_t last_conn_check = 0;
-    if (millis() - last_conn_check > 5000) {
-        last_conn_check = millis();
+#if ESP_NOW_ENABLED
+    static uint32_t last_check = 0;
+    if (millis() - last_check > 5000) {
+        last_check = millis();
         espnowSender.checkConnection();
     }
-    #elif WIFI_ENABLED
-    static uint32_t last_wifi_check = 0;
-    if (millis() - last_wifi_check > 1000) {
-        last_wifi_check = millis();
+#elif WIFI_ENABLED
+    static uint32_t last_check = 0;
+    if (millis() - last_check > 1000) {
+        last_check = millis();
         wifiSender.checkConnection();
     }
-    #endif
+#endif
     
-    // Update scheduler timing
     scheduler.update();
     
-    // State machine
     switch (state) {
-        case NodeState::LISTENING:
-            handleListeningState();
-            break;
-        case NodeState::INIT_SEND_POLL:
-            handleInitSendPoll();
-            break;
-        case NodeState::INIT_WAIT_RESP:
-            handleInitWaitResp();
-            break;
-        case NodeState::INIT_SEND_FINAL:
-            handleInitSendFinal();
-            break;
-        case NodeState::INIT_WAIT_REPORT:
-            handleInitWaitReport();
-            break;
-        case NodeState::INIT_CALCULATE:
-            handleInitCalculate();
-            break;
-        case NodeState::RESP_SEND_RESP:
-            handleRespSendResp();
-            break;
-        case NodeState::RESP_WAIT_FINAL:
-            handleRespWaitFinal();
-            break;
-        case NodeState::RESP_SEND_REPORT:
-            handleRespSendReport();
-            break;
-        case NodeState::HELLO_SEND:
-            handleHelloSend();
-            break;
+        case NodeState::LISTENING:      handleListeningState(); break;
+        case NodeState::INIT_SEND_POLL: handleInitSendPoll(); break;
+        case NodeState::INIT_WAIT_RESP: handleInitWaitResp(); break;
+        case NodeState::INIT_SEND_FINAL: handleInitSendFinal(); break;
+        case NodeState::INIT_WAIT_REPORT: handleInitWaitReport(); break;
+        case NodeState::INIT_CALCULATE: handleInitCalculate(); break;
+        case NodeState::RESP_SEND_RESP: handleRespSendResp(); break;
+        case NodeState::RESP_WAIT_FINAL: handleRespWaitFinal(); break;
+        case NodeState::RESP_SEND_REPORT: handleRespSendReport(); break;
+        case NodeState::HELLO_SEND:     handleHelloSend(); break;
         default:
-            Serial.println("[ERROR] Unknown state!");
             enterListeningMode();
             break;
     }
     
-    // Periodic status output (every 5 seconds)
+    // Status every 10s
     static uint32_t last_status = 0;
-    if (millis() - last_status > 5000) {
+    if (millis() - last_status > 10000) {
         printStatus();
         last_status = millis();
     }
     
-    // Flush logs periodically
+    // Mesh report every 30s
+    static uint32_t last_mesh = 0;
+    if (millis() - last_mesh > 30000) {
+        neighborTable.printMeshStatus();
+        last_mesh = millis();
+    }
+    
+    // Send neighbor table to base station every 5s
+    static uint32_t last_neighbor_broadcast = 0;
+    if (millis() - last_neighbor_broadcast > 5000) {
+        broadcastNeighborTable();
+        last_neighbor_broadcast = millis();
+    }
+    
+    // Flush logs
     static uint32_t last_flush = 0;
     if (millis() - last_flush > 1000) {
         rangeLogger.flushToSerial();
@@ -248,289 +311,240 @@ void loop() {
 }
 
 // =============================================================================
+// LISTEN-BEFORE-TALK
+// =============================================================================
+#if LBT_ENABLED
+bool performLBT() {
+    uwb.clearSystemStatus();
+    uwb.standardRX();
+    
+    uint32_t start = millis();
+    while (millis() - start < LBT_LISTEN_MS) {
+        if (uwb.receivedFrameSucc() == 1) {
+            uwb.clearSystemStatus();
+            return false;  // Channel busy
+        }
+        delayMicroseconds(100);
+    }
+    return true;  // Channel clear
+}
+#else
+bool performLBT() { return true; }
+#endif
+
+// =============================================================================
 // LISTENING STATE
 // =============================================================================
 void handleListeningState() {
-    // Priority 1: Send HELLO if due
+    // Send HELLO if due
     if (scheduler.shouldSendHello()) {
-        Serial.println("[STATE] -> HELLO_SEND");
         transitionTo(NodeState::HELLO_SEND);
         return;
     }
     
-    // Priority 2: Initiate ranging if in my slot and have neighbors
+    // Initiate ranging in my slot
     if (scheduler.canInitiateRanging()) {
         uint8_t target = neighborTable.getNextRangingTarget();
         if (target != 0) {
             session.target_id = target;
             session.is_initiator = true;
+            retry_count = 0;
+            lbt_retries = 0;
             
-            // Increase CPU frequency for accurate ranging
-            if (REDUCE_CPU_FREQ) {
-                setCpuFrequencyMhz(CPU_FREQ_HIGH);
-            }
-            
-            Serial.print("[STATE] -> INIT_SEND_POLL to node ");
+            Serial.print("[RANGE] -> ");
             Serial.println(target);
+            
             transitionTo(NodeState::INIT_SEND_POLL);
             return;
         }
     }
     
-    // Priority 3: Check for incoming frames
-    int rx_status = uwb.receivedFrameSucc();
-    if (rx_status == 1) {
-        processReceivedFrame();
-    } else if (rx_status == 2) {
-        // RX error - clear and restart
-        Serial.println("[RX] Error, restarting RX");
+    // Process incoming
+    int rx = uwb.receivedFrameSucc();
+    
+    if (rx == 1) {
+        uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
+        uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
+        uint8_t dest_id = uwb.read(RX_BUFFER_0_REG, 0x02) & 0xFF;
+        uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
+        
+        // Mode=1 is DS-TWR format (used for both HELLO and ranging)
+        if (mode == 1) {
+            // Stage 0 = HELLO beacon
+            if (stage == 0 && dest_id == BROADCAST_ID) {
+                neighborTable.processHello(sender_id, 0, neighborTable.getActiveCount());
+                
+                // SLOT COLLISION DETECTION
+                uint8_t sender_slot = sender_id % NUM_SLOTS;
+                uint8_t my_slot = TAG_ID % NUM_SLOTS;
+                if (sender_slot == my_slot) {
+                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    Serial.print("!! SLOT COLLISION: Node ");
+                    Serial.print(sender_id);
+                    Serial.print(" has same slot ");
+                    Serial.println(my_slot);
+                    Serial.println("!! Consider using -DTAG_ID_OVERRIDE=X");
+                    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                }
+                
+#if SYNC_TO_LOWER_ID
+                if (sender_id < TAG_ID) {
+                    uint8_t sender_slot = sender_id % NUM_SLOTS;
+                    uint32_t now = millis();
+                    uint32_t frame_start = now - (sender_slot * SLOT_LENGTH_MS) - (SLOT_LENGTH_MS / 2);
+                    scheduler.syncFrameStart(frame_start);
+                }
+#endif
+                
+                uwb.clearSystemStatus();
+                uwb.standardRX();
+                return;
+            }
+            
+            // Stage 1 = POLL (someone wants to range with us)
+            if (stage == STAGE_POLL && (dest_id == TAG_ID || dest_id == BROADCAST_ID)) {
+                session.target_id = sender_id;
+                session.is_initiator = false;
+                session.rx_poll = uwb.readRXTimestamp();
+                
+                uwb.clearSystemStatus();
+                
+                Serial.print("[POLL] <- ");
+                Serial.println(sender_id);
+                
+                scheduler.enterRespondingMode();
+                transitionTo(NodeState::RESP_SEND_RESP);
+                return;
+            }
+        }
+        
+        uwb.clearSystemStatus();
+        uwb.standardRX();
+    } else if (rx == 2) {
         uwb.clearSystemStatus();
         uwb.standardRX();
     }
-}
-
-// =============================================================================
-// HELLO STATE
-// =============================================================================
-void handleHelloSend() {
-    Serial.println("[HELLO] Sending...");
-    
-    // Use the driver's proven TX method
-    // Set destination to broadcast
-    uwb.setSenderID(TAG_ID);
-    uwb.setDestinationID(BROADCAST_ID);
-    
-    // Use ds_sendFrame with stage=0 (DS-TWR uses 1,2,3,4)
-    // This uses the exact same code path that works for ranging
-    uwb.ds_sendFrame(0);  // Stage 0 = HELLO
-    
-    Serial.print("[HELLO] Sent seq=");
-    Serial.println(hello_seq);
-    hello_seq++;
-    scheduler.markHelloSent();
-    
-    state = NodeState::LISTENING;
-    state_entry_time = millis();
-}
-
-// =============================================================================
-// FRAME PROCESSING
-// =============================================================================
-void processReceivedFrame() {
-    // Read frame data
-    uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
-    uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
-    uint8_t dest_id = uwb.read(RX_BUFFER_0_REG, 0x02) & 0xFF;
-    uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
-    unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
-    
-    Serial.print("[RX] m=");
-    Serial.print(mode);
-    Serial.print(" from=");
-    Serial.print(sender_id);
-    Serial.print(" to=");
-    Serial.print(dest_id);
-    Serial.print(" stg=");
-    Serial.println(stage);
-    
-    uwb.clearSystemStatus();
-    
-    // Ignore invalid frames
-    if (sender_id == TAG_ID || sender_id == 0) {
-        uwb.standardRX();
-        return;
-    }
-    
-    // Mode=1 is DS-TWR format (used for both HELLO and ranging)
-    if (mode == 1) {
-        
-        // Stage 0 = HELLO beacon
-        if (stage == 0 && dest_id == BROADCAST_ID) {
-            Serial.print("[HELLO] From ");
-            Serial.println(sender_id);
-            
-            // Add to neighbor table
-            neighborTable.processHello(sender_id, 0, 100);
-            
-            // Sync ONLY to the LOWEST ID neighbor (prevents sync thrashing)
-            #if SYNC_TO_LOWER_ID
-            static uint8_t sync_master_id = 0;  // Track who we're syncing to
-            
-            if (sender_id < TAG_ID) {
-                // Update sync master to lowest ID seen
-                if (sync_master_id == 0 || sender_id < sync_master_id) {
-                    sync_master_id = sender_id;
-                    Serial.print("[SYNC] New master: ");
-                    Serial.println(sync_master_id);
-                }
-                
-                // Only sync if this is THE lowest ID neighbor (the sync master)
-                if (sender_id == sync_master_id) {
-                    uint8_t sender_slot = sender_id % NUM_SLOTS;
-                    uint32_t now = millis();
-                    uint32_t estimated_frame_start = now - (sender_slot * SLOT_LENGTH_MS) - (SLOT_LENGTH_MS / 2);
-                    scheduler.syncFrameStart(estimated_frame_start);
-                    // Only print occasionally to reduce spam
-                    static uint32_t last_sync_print = 0;
-                    if (now - last_sync_print > 5000) {
-                        Serial.print("[SYNC] To node ");
-                        Serial.println(sender_id);
-                        last_sync_print = now;
-                    }
-                }
-            }
-            #endif
-            
-            uwb.standardRX();
-            return;
-        }
-        
-        // Stage 1 = POLL (start of DS-TWR)
-        if (stage == STAGE_POLL && (dest_id == TAG_ID || dest_id == BROADCAST_ID)) {
-            Serial.print("[POLL] From ");
-            Serial.println(sender_id);
-            
-            session.target_id = sender_id;
-            session.is_initiator = false;
-            session.rx_poll = rx_ts;  // Use captured timestamp
-            
-            scheduler.enterRespondingMode();
-            transitionTo(NodeState::RESP_SEND_RESP);
-            return;
-        }
-    }
-    
-    // Unknown frame - ignore
-    uwb.standardRX();
 }
 
 // =============================================================================
 // INITIATOR STATES
 // =============================================================================
 void handleInitSendPoll() {
-    uwb.clearSystemStatus();
+    // Jitter
+    if (scheduler.shouldAddJitter()) {
+        delay(scheduler.getJitterDelay());
+    }
     
-    // Set IDs
+    // LBT
+#if LBT_ENABLED
+    if (!performLBT()) {
+        lbt_retries++;
+        if (lbt_retries >= LBT_MAX_RETRIES) {
+            Serial.println("[LBT] Busy, abort");
+            scheduler.reportCollision();
+            neighborTable.recordCollision(session.target_id);
+            enterListeningMode();
+            return;
+        }
+        delay(random(LBT_BACKOFF_BASE_MS, LBT_BACKOFF_MAX_MS));
+        return;
+    }
+#endif
+    
+    uwb.clearSystemStatus();
     uwb.setSenderID(TAG_ID);
     uwb.setDestinationID(session.target_id);
     
-    // Send POLL using DS-TWR frame (mode=1, stage=1)
+    if (REDUCE_CPU_FREQ) setCpuFrequencyMhz(CPU_FREQ_HIGH);
+    
     uwb.ds_sendFrame(STAGE_POLL);
-    
     session.tx_poll = uwb.readTXTimestamp();
-    
-    Serial.print("[POLL] Sent to node ");
-    Serial.println(session.target_id);
     
     transitionTo(NodeState::INIT_WAIT_RESP);
 }
 
 void handleInitWaitResp() {
-    // Check timeout
     if (checkStateTimeout(RESPONSE_TIMEOUT_MS)) {
-        Serial.println("[TIMEOUT] Waiting for RESP");
-        if (++retry_count <= MAX_RANGING_RETRIES) {
+        retry_count++;
+        if (retry_count < MAX_RANGING_RETRIES) {
             transitionTo(NodeState::INIT_SEND_POLL);
         } else {
             LOG_RANGE_FAILURE(TAG_ID, session.target_id, scheduler.getFrameNumber(), "RESP_TIMEOUT");
             neighborTable.recordRangingFailure(session.target_id);
-            retry_count = 0;
             enterListeningMode();
         }
         return;
     }
     
-    // Check for response
-    int rx_status = uwb.receivedFrameSucc();
-    if (rx_status == 1) {
+    int rx = uwb.receivedFrameSucc();
+    if (rx == 1) {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
-        unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
+        unsigned long long rx_ts = uwb.readRXTimestamp();
         
         uwb.clearSystemStatus();
         
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_RESP) {
             session.rx_resp = rx_ts;
             session.t_round_a = session.rx_resp - session.tx_poll;
-            retry_count = 0;
-            
-            Serial.println("[RESP] Received");
             transitionTo(NodeState::INIT_SEND_FINAL);
         } else {
             uwb.standardRX();
         }
-    } else if (rx_status == 2) {
+    } else if (rx == 2) {
         uwb.clearSystemStatus();
         uwb.standardRX();
     }
 }
 
 void handleInitSendFinal() {
+    uwb.setSenderID(TAG_ID);
+    uwb.setDestinationID(session.target_id);
+    
     uwb.ds_sendFrame(STAGE_FINAL);
     
     session.tx_final = uwb.readTXTimestamp();
     session.t_reply_a = session.tx_final - session.rx_resp;
     
-    Serial.println("[FINAL] Sent");
     transitionTo(NodeState::INIT_WAIT_REPORT);
 }
 
 void handleInitWaitReport() {
-    // Check timeout
     if (checkStateTimeout(RESPONSE_TIMEOUT_MS)) {
-        Serial.println("[TIMEOUT] Waiting for REPORT");
         LOG_RANGE_FAILURE(TAG_ID, session.target_id, scheduler.getFrameNumber(), "REPORT_TIMEOUT");
         neighborTable.recordRangingFailure(session.target_id);
         enterListeningMode();
         return;
     }
     
-    // Check for REPORT
-    int rx_status = uwb.receivedFrameSucc();
-    if (rx_status == 1) {
+    int rx = uwb.receivedFrameSucc();
+    if (rx == 1) {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
-        uint8_t dest_id = uwb.read(RX_BUFFER_0_REG, 0x02) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
         
-        // Debug print received frame
-        Serial.print("[RX-RPT] from=");
-        Serial.print(sender_id);
-        Serial.print(" to=");
-        Serial.print(dest_id);
-        Serial.print(" stg=");
-        Serial.println(stage);
-        
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_REPORT) {
-            // Read timing data from REPORT payload BEFORE clearing status!
             session.report_t_round_b = uwb.read(RX_BUFFER_0_REG, 0x04);
             session.report_t_reply_b = uwb.read(RX_BUFFER_0_REG, 0x08);
             session.clock_offset = uwb.getRawClockOffset();
             
             uwb.clearSystemStatus();
-            
-            Serial.println("[REPORT] Received");
             transitionTo(NodeState::INIT_CALCULATE);
         } else {
             uwb.clearSystemStatus();
             uwb.standardRX();
         }
-    } else if (rx_status == 2) {
+    } else if (rx == 2) {
         uwb.clearSystemStatus();
         uwb.standardRX();
     }
 }
 
 void handleInitCalculate() {
-    // Use timing info already read in handleInitWaitReport
-    uint32_t t_round_b = session.report_t_round_b;
-    uint32_t t_reply_b = session.report_t_reply_b;
-    
-    // Calculate distance
     int ranging_time = uwb.ds_processRTInfo(
         session.t_round_a, session.t_reply_a,
-        t_round_b, t_reply_b,
+        session.report_t_round_b, session.report_t_reply_b,
         session.clock_offset
     );
     
@@ -538,26 +552,29 @@ void handleInitCalculate() {
     float rssi = uwb.getSignalStrength();
     float fp_rssi = uwb.getFirstPathSignalStrength();
     
-    // Log and record
     LOG_RANGE_SUCCESS(TAG_ID, session.target_id, distance_cm, rssi, fp_rssi, 
                       scheduler.getFrameNumber());
     neighborTable.recordRangingSuccess(session.target_id, distance_cm, rssi);
     
-    // Send to central station via ESP-NOW or WiFi
-    #if ESP_NOW_ENABLED
-    espnowSender.sendRangingResult(TAG_ID, session.target_id, distance_cm, rssi, millis());
-    #elif WIFI_ENABLED
-    wifiSender.sendRangingResult(TAG_ID, session.target_id, distance_cm, rssi, millis());
-    #endif
+    // Get FILTERED distance to send (raw values can be noisy/negative)
+    Neighbor* n = neighborTable.getNeighbor(session.target_id);
+    float filtered_dist = (n && n->filtered_distance_cm > 0) ? n->filtered_distance_cm : distance_cm;
     
-    // Print result
-    Serial.print("[DISTANCE] ");
+#if ESP_NOW_ENABLED
+    espnowSender.sendRangingResult(TAG_ID, session.target_id, filtered_dist, rssi, millis());
+#elif WIFI_ENABLED
+    wifiSender.sendRangingResult(TAG_ID, session.target_id, filtered_dist, rssi, millis());
+#endif
+    
+    Serial.print("[DIST] ");
     Serial.print(TAG_ID);
-    Serial.print(" -> ");
+    Serial.print("->");
     Serial.print(session.target_id);
     Serial.print(": ");
     Serial.print(distance_cm, 1);
-    Serial.println(" cm");
+    Serial.print(" cm (filtered: ");
+    Serial.print(filtered_dist, 1);
+    Serial.println(" cm)");
     
     enterListeningMode();
 }
@@ -574,60 +591,74 @@ void handleRespSendResp() {
     session.tx_resp = uwb.readTXTimestamp();
     session.t_reply_b = session.tx_resp - session.rx_poll;
     
-    Serial.println("[RESP] Sent");
     transitionTo(NodeState::RESP_WAIT_FINAL);
 }
 
 void handleRespWaitFinal() {
-    // Check timeout
     if (checkStateTimeout(RESPONSE_TIMEOUT_MS)) {
-        Serial.println("[TIMEOUT] Waiting for FINAL");
         scheduler.exitRespondingMode();
         enterListeningMode();
         return;
     }
     
-    // Check for FINAL
-    int rx_status = uwb.receivedFrameSucc();
-    if (rx_status == 1) {
+    int rx = uwb.receivedFrameSucc();
+    if (rx == 1) {
         uint8_t mode = uwb.read(RX_BUFFER_0_REG, 0x00) & 0x07;
         uint8_t sender_id = uwb.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
         uint8_t stage = uwb.read(RX_BUFFER_0_REG, 0x03) & 0x07;
-        unsigned long long rx_ts = uwb.readRXTimestamp();  // Read BEFORE clear!
+        unsigned long long rx_ts = uwb.readRXTimestamp();
         
         uwb.clearSystemStatus();
         
         if (mode == 1 && sender_id == session.target_id && stage == STAGE_FINAL) {
             session.rx_final = rx_ts;
             session.t_round_b = session.rx_final - session.tx_resp;
-            
-            Serial.println("[FINAL] Received");
             transitionTo(NodeState::RESP_SEND_REPORT);
         } else {
             uwb.standardRX();
         }
-    } else if (rx_status == 2) {
+    } else if (rx == 2) {
         uwb.clearSystemStatus();
         uwb.standardRX();
     }
 }
 
 void handleRespSendReport() {
-    // CRITICAL: Set sender/destination before sending REPORT
     uwb.setSenderID(TAG_ID);
     uwb.setDestinationID(session.target_id);
     
-    // Send REPORT with timing info using driver's method
     uwb.ds_sendRTInfo(session.t_round_b, session.t_reply_b);
-    
-    Serial.println("[REPORT] Sent");
     
     scheduler.exitRespondingMode();
     enterListeningMode();
 }
 
 // =============================================================================
-// HELPER FUNCTIONS
+// HELLO BEACON
+// =============================================================================
+void handleHelloSend() {
+    delay(random(0, 50));
+    
+    uwb.clearSystemStatus();
+    uwb.setSenderID(TAG_ID);
+    uwb.setDestinationID(BROADCAST_ID);
+    
+    // Use ds_sendFrame with stage=0 for HELLO (same code path as ranging)
+    uwb.ds_sendFrame(0);  // Stage 0 = HELLO
+    
+    scheduler.markHelloSent();
+    
+    if (DEBUG_OUTPUT) {
+        Serial.print("[HELLO] seq=");
+        Serial.println(hello_seq);
+    }
+    hello_seq++;
+    
+    enterListeningMode();
+}
+
+// =============================================================================
+// HELPERS
 // =============================================================================
 void transitionTo(NodeState new_state) {
     state = new_state;
@@ -644,43 +675,39 @@ void enterListeningMode() {
     uwb.clearSystemStatus();
     uwb.standardRX();
     
-    // Restore normal CPU frequency for power saving
     if (REDUCE_CPU_FREQ) {
         setCpuFrequencyMhz(CPU_FREQ_NORMAL);
     }
 }
 
 // =============================================================================
-// UWB INITIALIZATION
+// UWB INIT
 // =============================================================================
 void initializeUWB() {
-    Serial.println("[INIT] Starting UWB...");
+    Serial.println("[UWB] Init...");
     
     uwb.begin();
     hardResetDW();
     delay(200);
     
     if (!uwb.checkSPI()) {
-        Serial.println("[FATAL] SPI failed!");
-        while (1) { delay(1000); }
+        Serial.println("[FATAL] SPI fail");
+        while (1) delay(1000);
     }
-    Serial.println("[INIT] SPI OK");
     
     int timeout = 100;
-    while (!uwb.checkForIDLE() && timeout-- > 0) {
-        delay(100);
-    }
+    while (!uwb.checkForIDLE() && timeout-- > 0) delay(100);
     if (timeout <= 0) {
-        Serial.println("[FATAL] IDLE timeout!");
-        while (1) { delay(1000); }
+        Serial.println("[FATAL] IDLE timeout");
+        while (1) delay(1000);
     }
     
     uwb.softReset();
     delay(200);
     
     if (!uwb.checkForIDLE()) {
-        Serial.println("[FATAL] IDLE failed after reset!");
-        while (1) { delay(1000); }
+        Serial.println("[FATAL] IDLE fail");
+        while (1) delay(1000);
     }
     
     uwb.init();
@@ -690,11 +717,10 @@ void initializeUWB() {
     uwb.configureAsTX();
     uwb.clearSystemStatus();
     
-    Serial.println("[INIT] UWB ready");
+    Serial.println("[UWB] Ready");
 }
 
 void resetRadio() {
-    Serial.println("[RESET] Radio reset...");
     uwb.softReset();
     delay(100);
     uwb.init();
@@ -714,29 +740,24 @@ void hardResetDW() {
 }
 
 // =============================================================================
-// STATUS OUTPUT
+// STATUS
 // =============================================================================
 void printStatus() {
-    Serial.println("\n========== NODE STATUS ==========");
-    Serial.print("Node ID: ");
+    Serial.println("\n======== MESH NODE ========");
+    Serial.print("ID: ");
     Serial.print(TAG_ID);
     Serial.print(" | Slot: ");
-    Serial.print(MY_SLOT);
+    Serial.print(scheduler.getMySlot());
+    Serial.print("/");
+    Serial.print(NUM_SLOTS - 1);
     Serial.print(" | Frame: ");
     Serial.println(scheduler.getFrameNumber());
     
-    SlotInfo slot = scheduler.getSlotInfo();
-    Serial.print("Current Slot: ");
-    Serial.print(slot.current_slot);
-    Serial.print(" | Is My Slot: ");
-    Serial.print(slot.is_my_slot ? "YES" : "NO");
-    Serial.print(" | Synced: ");
-    Serial.println(scheduler.isSynced() ? "YES" : "NO");
-    
-    Serial.print("Active Neighbors: ");
-    Serial.println(neighborTable.getActiveNeighborCount());
+    Serial.print("Neighbors: ");
+    Serial.print(neighborTable.getActiveCount());
+    Serial.print(" | Eligible: ");
+    Serial.println(neighborTable.getEligibleCount());
     
     neighborTable.printTable();
-    
-    Serial.println("=================================\n");
+    Serial.println("===========================\n");
 }

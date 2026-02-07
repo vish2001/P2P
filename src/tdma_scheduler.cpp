@@ -14,6 +14,28 @@ TDMAScheduler::TDMAScheduler() {
     responding = false;
     hello_pending = true;  // Send HELLO at startup
     synced = false;
+    my_slot = 0;  // Will be set properly in recalculateSlot()
+    
+    // Collision mitigation
+    collision_count = 0;
+    last_collision_ms = 0;
+    skip_next_slot = false;
+}
+
+// =============================================================================
+// SLOT RECALCULATION
+// =============================================================================
+void TDMAScheduler::recalculateSlot() {
+    // Called after TAG_ID is assigned
+    my_slot = TAG_ID % NUM_SLOTS;
+    
+    Serial.print("[TDMA] Slot assigned: ");
+    Serial.print(my_slot);
+    Serial.print(" (TAG_ID=");
+    Serial.print(TAG_ID);
+    Serial.print(", NUM_SLOTS=");
+    Serial.print(NUM_SLOTS);
+    Serial.println(")");
 }
 
 // =============================================================================
@@ -22,10 +44,16 @@ TDMAScheduler::TDMAScheduler() {
 void TDMAScheduler::update() {
     checkFrameRollover();
     
-    // Check if HELLO is due
+    // Check if HELLO is due (with jitter to prevent storms)
     uint32_t now = millis();
-    if (now - last_hello_ms >= HELLO_INTERVAL_MS) {
+    uint32_t hello_interval = HELLO_INTERVAL_MS + random(0, HELLO_JITTER_MS);
+    if (now - last_hello_ms >= hello_interval) {
         hello_pending = true;
+    }
+    
+    // Reset skip flag at start of new frame
+    if (frame_number > 0 && skip_next_slot) {
+        skip_next_slot = false;
     }
 }
 
@@ -36,12 +64,15 @@ uint8_t TDMAScheduler::calculateCurrentSlot() {
     uint32_t now = millis();
     uint32_t frame_elapsed = now - frame_start_ms;
     
-    // Handle wraparound
     if (frame_elapsed >= FRAME_LENGTH_MS) {
         frame_elapsed = frame_elapsed % FRAME_LENGTH_MS;
     }
     
     return (uint8_t)(frame_elapsed / SLOT_LENGTH_MS);
+}
+
+uint8_t TDMAScheduler::getMySlot() {
+    return my_slot;
 }
 
 void TDMAScheduler::checkFrameRollover() {
@@ -52,9 +83,15 @@ void TDMAScheduler::checkFrameRollover() {
         frame_start_ms = now - (frame_elapsed % FRAME_LENGTH_MS);
         frame_number++;
         
+        // Reset collision skip at frame boundary
+        skip_next_slot = false;
+        
         if (DEBUG_OUTPUT && (frame_number % 10 == 0)) {
             Serial.print("[TDMA] Frame ");
-            Serial.println(frame_number);
+            Serial.print(frame_number);
+            Serial.print(" (");
+            Serial.print(FRAME_LENGTH_MS);
+            Serial.println("ms)");
         }
     }
 }
@@ -73,7 +110,7 @@ SlotInfo TDMAScheduler::getSlotInfo() {
     info.slot_start_ms = frame_start_ms + (info.current_slot * SLOT_LENGTH_MS);
     info.slot_elapsed_ms = now - info.slot_start_ms;
     info.slot_remaining_ms = SLOT_LENGTH_MS - info.slot_elapsed_ms;
-    info.is_my_slot = (info.current_slot == MY_SLOT);
+    info.is_my_slot = (info.current_slot == my_slot);
     
     return info;
 }
@@ -86,20 +123,44 @@ bool TDMAScheduler::canInitiateRanging() {
         return false;
     }
     
+    // Check if we should skip due to collision backoff
+    if (skip_next_slot) {
+        return false;
+    }
+    
     SlotInfo info = getSlotInfo();
     
     if (!info.is_my_slot) {
         return false;
     }
     
-    // Need at least 30ms for DS-TWR exchange
-    const uint32_t MIN_TIME_FOR_RANGING = 30;
+    // Need at least MIN_SLOT_MS for DS-TWR exchange
+    const uint32_t MIN_TIME_FOR_RANGING = MIN_SLOT_MS - 5;
     
     if (info.slot_remaining_ms < MIN_TIME_FOR_RANGING) {
         return false;
     }
     
     return true;
+}
+
+bool TDMAScheduler::shouldAddJitter() {
+    // Always add jitter - it helps with collision mitigation
+    return true;
+}
+
+uint8_t TDMAScheduler::getJitterDelay() {
+    // Base jitter
+    uint8_t jitter = random(0, SLOT_JITTER_MAX_MS);
+    
+    // Add extra backoff if we've had recent collisions
+    if (collision_count > 0) {
+        uint32_t extra = collision_count * LBT_BACKOFF_BASE_MS;
+        extra = min(extra, (uint32_t)LBT_BACKOFF_MAX_MS);
+        jitter += random(0, extra);
+    }
+    
+    return jitter;
 }
 
 // =============================================================================
@@ -159,6 +220,36 @@ uint32_t TDMAScheduler::getLastSyncTime() {
 }
 
 // =============================================================================
+// COLLISION HANDLING
+// =============================================================================
+void TDMAScheduler::reportCollision() {
+    collision_count++;
+    last_collision_ms = millis();
+    
+    // After multiple collisions, skip next slot opportunity
+    if (collision_count >= 3) {
+        skip_next_slot = true;
+        Serial.println("[TDMA] Too many collisions, skipping next slot");
+    }
+    
+    // Decay collision count over time
+    if (collision_count > 0 && millis() - last_collision_ms > 10000) {
+        collision_count = collision_count / 2;
+    }
+}
+
+uint8_t TDMAScheduler::getCollisionBackoff() {
+    if (collision_count == 0) return 0;
+    
+    uint8_t backoff = COLLISION_BACKOFF_MS * collision_count;
+    return min(backoff, (uint8_t)100);
+}
+
+bool TDMAScheduler::shouldSkipSlot() {
+    return skip_next_slot;
+}
+
+// =============================================================================
 // TIMING HELPERS
 // =============================================================================
 uint32_t TDMAScheduler::timeUntilMySlot() {
@@ -169,10 +260,10 @@ uint32_t TDMAScheduler::timeUntilMySlot() {
     }
     
     uint8_t slots_until_mine;
-    if (MY_SLOT > info.current_slot) {
-        slots_until_mine = MY_SLOT - info.current_slot;
+    if (my_slot > info.current_slot) {
+        slots_until_mine = my_slot - info.current_slot;
     } else {
-        slots_until_mine = NUM_SLOTS - info.current_slot + MY_SLOT;
+        slots_until_mine = NUM_SLOTS - info.current_slot + my_slot;
     }
     
     return info.slot_remaining_ms + ((slots_until_mine - 1) * SLOT_LENGTH_MS);
@@ -195,16 +286,30 @@ void TDMAScheduler::printStatus() {
     Serial.println("\n=== TDMA STATUS ===");
     Serial.print("Frame: ");
     Serial.print(info.frame_number);
-    Serial.print(" | Synced: ");
+    Serial.print(" | Length: ");
+    Serial.print(FRAME_LENGTH_MS);
+    Serial.print("ms | Synced: ");
     Serial.println(synced ? "YES" : "NO");
+    
     Serial.print("Current Slot: ");
     Serial.print(info.current_slot);
+    Serial.print("/");
+    Serial.print(NUM_SLOTS - 1);
     Serial.print(" | My Slot: ");
-    Serial.print(MY_SLOT);
+    Serial.print(my_slot);
     Serial.print(" | Is Mine: ");
     Serial.println(info.is_my_slot ? "YES" : "NO");
+    
     Serial.print("Slot Remaining: ");
     Serial.print(info.slot_remaining_ms);
-    Serial.println(" ms");
+    Serial.print("ms | Slot Length: ");
+    Serial.print(SLOT_LENGTH_MS);
+    Serial.println("ms");
+    
+    Serial.print("Collisions: ");
+    Serial.print(collision_count);
+    Serial.print(" | Skip Next: ");
+    Serial.println(skip_next_slot ? "YES" : "NO");
+    
     Serial.println("===================\n");
 }

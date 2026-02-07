@@ -5,6 +5,9 @@
 // Global instance
 ESPNowSender espnowSender;
 
+// Broadcast MAC - all base stations in range will receive
+static const uint8_t BROADCAST_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
 // Static callback tracking
 static volatile uint32_t _send_success = 0;
 static volatile uint32_t _send_fail = 0;
@@ -15,17 +18,20 @@ ESPNowSender::ESPNowSender() {
     send_count = 0;
     fail_count = 0;
     
-    // Base station MAC from config
-    uint8_t mac[] = BASE_STATION_MAC;
-    memcpy(base_mac, mac, 6);
+    // Use broadcast MAC for multi-base-station support
+    memcpy(base_mac, BROADCAST_MAC, 6);
 }
 
 bool ESPNowSender::begin() {
-    Serial.println("[ESP-NOW] Initializing...");
+    Serial.println("[ESP-NOW] Initializing (broadcast mode)...");
     
     // Set WiFi mode to station
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    
+    // Print our MAC
+    Serial.print("[ESP-NOW] Node MAC: ");
+    Serial.println(WiFi.macAddress());
     
     // Set to channel 1 (ESP-NOW works on same channel as WiFi)
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -39,15 +45,15 @@ bool ESPNowSender::begin() {
     // Register callback
     esp_now_register_send_cb(onSent);
     
-    // Add base station as peer
+    // Add broadcast peer - this allows sending to all base stations
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(peer));
-    memcpy(peer.peer_addr, base_mac, 6);
+    memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     peer.channel = 0;  // 0 = use current channel
     peer.encrypt = false;
     
     if (esp_now_add_peer(&peer) != ESP_OK) {
-        Serial.println("[ESP-NOW] Failed to add peer");
+        Serial.println("[ESP-NOW] Failed to add broadcast peer");
         return false;
     }
     
@@ -55,7 +61,7 @@ bool ESPNowSender::begin() {
     esp_wifi_set_max_tx_power(50); // 12.5 dBm instead of 20 dBm
     
     initialized = true;
-    Serial.println("[ESP-NOW] Ready");
+    Serial.println("[ESP-NOW] Ready (broadcasting to all base stations)");
     return true;
 }
 
